@@ -1,0 +1,974 @@
+-- ============================================================================
+-- Aurora MySQL 3.x (MySQL 8.0 Compatible) Diagnostic Script
+-- Locks, Latches & Performance Schema
+-- Use Case: Query works individually but fails/blocks when run in parallel
+-- ============================================================================
+-- PREREQUISITES:
+--   1. performance_schema must be enabled (parameter group: performance_schema=1)
+--   2. User needs: SELECT on performance_schema, PROCESS privilege
+--   3. Run this WHILE the parallel workload is active to capture live state
+-- ============================================================================
+-- AURORA-SPECIFIC NOTES:
+--   - Storage I/O is handled by Aurora storage layer (no local page flushing)
+--   - Redo logs are offloaded to Aurora storage (no local log files)
+--   - Some InnoDB variables (io_capacity, log_buffer_size, etc.) don't exist
+--   - @@tx_isolation is removed; use @@transaction_isolation
+--   - Buffer pool dirty pages will show 0 (Aurora doesn't flush from DB tier)
+--   - Aurora has its own lock manager with dedicated memory tracking
+-- ============================================================================
+
+-- ============================================================================
+-- SECTION 1: AURORA INSTANCE IDENTITY & SERVER STATE
+-- ============================================================================
+
+SELECT '=== AURORA INSTANCE INFO ===' AS section;
+SELECT
+    VERSION() AS mysql_version,
+    @@aurora_version AS aurora_engine_version,
+    @@aurora_server_id AS aurora_server_id,
+    @@hostname AS hostname,
+    @@innodb_read_only AS is_reader_instance,
+    NOW() AS run_timestamp;
+
+SHOW GLOBAL STATUS LIKE 'Uptime';
+
+SELECT '=== ACTIVE THREADS ===' AS section;
+SELECT
+    id,
+    user,
+    host,
+    db,
+    command,
+    time AS seconds_running,
+    state,
+    LEFT(info, 200) AS query_preview
+FROM information_schema.PROCESSLIST
+WHERE command != 'Sleep'
+ORDER BY time DESC;
+
+-- ============================================================================
+-- SECTION 2: InnoDB LOCK DIAGNOSTICS
+-- ============================================================================
+
+SELECT '=== INNODB ENGINE STATUS ===' AS section;
+SHOW ENGINE INNODB STATUS;
+
+SELECT '=== CURRENT DATA LOCKS (performance_schema.data_locks) ===' AS section;
+SELECT
+    ENGINE,
+    ENGINE_LOCK_ID,
+    ENGINE_TRANSACTION_ID,
+    THREAD_ID,
+    EVENT_ID,
+    OBJECT_SCHEMA,
+    OBJECT_NAME,
+    PARTITION_NAME,
+    SUBPARTITION_NAME,
+    INDEX_NAME,
+    OBJECT_INSTANCE_BEGIN,
+    LOCK_TYPE,
+    LOCK_MODE,
+    LOCK_STATUS,
+    LOCK_DATA
+FROM performance_schema.data_locks
+ORDER BY ENGINE_TRANSACTION_ID, LOCK_TYPE;
+
+SELECT '=== DATA LOCK WAITS (Who is blocking whom) ===' AS section;
+SELECT
+    dlw.REQUESTING_ENGINE_LOCK_ID,
+    dlw.REQUESTING_ENGINE_TRANSACTION_ID AS waiting_trx_id,
+    dlw.REQUESTING_THREAD_ID AS waiting_thread,
+    dlw.BLOCKING_ENGINE_LOCK_ID,
+    dlw.BLOCKING_ENGINE_TRANSACTION_ID AS blocking_trx_id,
+    dlw.BLOCKING_THREAD_ID AS blocking_thread
+FROM performance_schema.data_lock_waits dlw;
+
+SELECT '=== DETAILED LOCK WAIT ANALYSIS ===' AS section;
+SELECT
+    r.trx_id AS waiting_trx_id,
+    r.trx_mysql_thread_id AS waiting_thread,
+    r.trx_state AS waiting_state,
+    LEFT(r.trx_query, 200) AS waiting_query,
+    r.trx_wait_started,
+    TIMESTAMPDIFF(SECOND, r.trx_wait_started, NOW()) AS wait_seconds,
+    b.trx_id AS blocking_trx_id,
+    b.trx_mysql_thread_id AS blocking_thread,
+    b.trx_state AS blocking_state,
+    LEFT(b.trx_query, 200) AS blocking_query,
+    b.trx_started AS blocking_trx_started,
+    dl.OBJECT_SCHEMA AS locked_schema,
+    dl.OBJECT_NAME AS locked_table,
+    dl.INDEX_NAME AS locked_index,
+    dl.LOCK_TYPE,
+    dl.LOCK_MODE,
+    dl.LOCK_DATA
+FROM information_schema.INNODB_TRX r
+JOIN performance_schema.data_lock_waits dlw
+    ON r.trx_id = dlw.REQUESTING_ENGINE_TRANSACTION_ID
+JOIN information_schema.INNODB_TRX b
+    ON b.trx_id = dlw.BLOCKING_ENGINE_TRANSACTION_ID
+JOIN performance_schema.data_locks dl
+    ON dl.ENGINE_LOCK_ID = dlw.BLOCKING_ENGINE_LOCK_ID;
+
+SELECT '=== ALL ACTIVE INNODB TRANSACTIONS ===' AS section;
+SELECT
+    trx_id,
+    trx_state,
+    trx_started,
+    TIMESTAMPDIFF(SECOND, trx_started, NOW()) AS trx_age_seconds,
+    trx_mysql_thread_id,
+    trx_tables_in_use,
+    trx_tables_locked,
+    trx_lock_structs,
+    trx_rows_locked,
+    trx_rows_modified,
+    trx_isolation_level,
+    trx_unique_checks,
+    trx_foreign_key_checks,
+    LEFT(trx_query, 200) AS current_query,
+    trx_operation_state,
+    trx_weight,
+    trx_lock_memory_bytes,
+    trx_autocommit_non_locking
+FROM information_schema.INNODB_TRX
+ORDER BY trx_started;
+
+SELECT '=== TRANSACTION ISOLATION LEVEL ===' AS section;
+SELECT @@transaction_isolation AS transaction_isolation_level;
+
+-- ============================================================================
+-- SECTION 3: METADATA LOCKS (MDL)
+-- ============================================================================
+
+SELECT '=== METADATA LOCKS ===' AS section;
+SELECT
+    OBJECT_TYPE,
+    OBJECT_SCHEMA,
+    OBJECT_NAME,
+    COLUMN_NAME,
+    LOCK_TYPE,
+    LOCK_DURATION,
+    LOCK_STATUS,
+    SOURCE,
+    OWNER_THREAD_ID,
+    OWNER_EVENT_ID
+FROM performance_schema.metadata_locks
+WHERE OBJECT_SCHEMA NOT IN ('performance_schema', 'information_schema', 'mysql')
+ORDER BY OBJECT_SCHEMA, OBJECT_NAME, LOCK_STATUS;
+
+SELECT '=== MDL LOCK WAITERS (Blocked DDL/DML) ===' AS section;
+SELECT
+    ml_waiting.OBJECT_SCHEMA,
+    ml_waiting.OBJECT_NAME,
+    ml_waiting.LOCK_TYPE AS waiting_lock_type,
+    ml_waiting.LOCK_STATUS AS waiting_status,
+    ml_waiting.OWNER_THREAD_ID AS waiting_thread,
+    t_waiting.PROCESSLIST_ID AS waiting_pid,
+    LEFT(t_waiting.PROCESSLIST_INFO, 200) AS waiting_query,
+    ml_blocking.LOCK_TYPE AS blocking_lock_type,
+    ml_blocking.LOCK_STATUS AS blocking_status,
+    ml_blocking.OWNER_THREAD_ID AS blocking_thread,
+    t_blocking.PROCESSLIST_ID AS blocking_pid,
+    LEFT(t_blocking.PROCESSLIST_INFO, 200) AS blocking_query
+FROM performance_schema.metadata_locks ml_waiting
+JOIN performance_schema.metadata_locks ml_blocking
+    ON ml_waiting.OBJECT_SCHEMA = ml_blocking.OBJECT_SCHEMA
+    AND ml_waiting.OBJECT_NAME = ml_blocking.OBJECT_NAME
+    AND ml_waiting.LOCK_STATUS = 'PENDING'
+    AND ml_blocking.LOCK_STATUS = 'GRANTED'
+JOIN performance_schema.threads t_waiting
+    ON ml_waiting.OWNER_THREAD_ID = t_waiting.THREAD_ID
+JOIN performance_schema.threads t_blocking
+    ON ml_blocking.OWNER_THREAD_ID = t_blocking.THREAD_ID;
+
+-- ============================================================================
+-- SECTION 4: TABLE LOCKS
+-- ============================================================================
+
+SELECT '=== TABLE LOCK WAITS SUMMARY ===' AS section;
+SELECT
+    OBJECT_SCHEMA,
+    OBJECT_NAME,
+    COUNT_STAR AS total_waits,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms,
+    AVG_TIMER_WAIT / 1000000000 AS avg_wait_ms,
+    MAX_TIMER_WAIT / 1000000000 AS max_wait_ms
+FROM performance_schema.table_lock_waits_summary_by_table
+WHERE COUNT_STAR > 0
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 20;
+
+SELECT '=== TABLE IO WAITS SUMMARY ===' AS section;
+SELECT
+    OBJECT_SCHEMA,
+    OBJECT_NAME,
+    COUNT_STAR AS total_io_waits,
+    SUM_TIMER_WAIT / 1000000000 AS total_io_wait_ms,
+    COUNT_READ,
+    SUM_TIMER_READ / 1000000000 AS total_read_wait_ms,
+    COUNT_WRITE,
+    SUM_TIMER_WRITE / 1000000000 AS total_write_wait_ms,
+    COUNT_FETCH,
+    COUNT_INSERT,
+    COUNT_UPDATE,
+    COUNT_DELETE
+FROM performance_schema.table_io_waits_summary_by_table
+WHERE OBJECT_SCHEMA NOT IN ('performance_schema', 'mysql', 'information_schema', 'sys')
+    AND COUNT_STAR > 0
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 20;
+
+SELECT '=== TABLE IO WAITS BY INDEX ===' AS section;
+SELECT
+    OBJECT_SCHEMA,
+    OBJECT_NAME,
+    INDEX_NAME,
+    COUNT_STAR AS total_waits,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms,
+    COUNT_READ,
+    COUNT_WRITE,
+    COUNT_FETCH,
+    COUNT_INSERT,
+    COUNT_UPDATE,
+    COUNT_DELETE
+FROM performance_schema.table_io_waits_summary_by_index_usage
+WHERE OBJECT_SCHEMA NOT IN ('performance_schema', 'mysql', 'information_schema', 'sys')
+    AND COUNT_STAR > 0
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 30;
+
+-- ============================================================================
+-- SECTION 5: MUTEX & LATCH DIAGNOSTICS
+-- ============================================================================
+
+SELECT '=== INNODB MUTEXES (Latches) ===' AS section;
+SHOW ENGINE INNODB MUTEX;
+
+SELECT '=== PERFORMANCE SCHEMA MUTEX INSTANCES (Currently Locked) ===' AS section;
+SELECT
+    NAME AS mutex_name,
+    OBJECT_INSTANCE_BEGIN,
+    LOCKED_BY_THREAD_ID
+FROM performance_schema.mutex_instances
+WHERE LOCKED_BY_THREAD_ID IS NOT NULL
+ORDER BY NAME;
+
+SELECT '=== MUTEX WAIT SUMMARY (Top by total wait time) ===' AS section;
+SELECT
+    EVENT_NAME,
+    COUNT_STAR AS total_waits,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms,
+    AVG_TIMER_WAIT / 1000000000 AS avg_wait_ms,
+    MAX_TIMER_WAIT / 1000000000 AS max_wait_ms
+FROM performance_schema.events_waits_summary_global_by_event_name
+WHERE EVENT_NAME LIKE 'wait/synch/mutex%'
+    AND COUNT_STAR > 0
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 30;
+
+SELECT '=== AURORA LOCK THREAD SLOT FUTEX (Row lock contention indicator) ===' AS section;
+SELECT
+    EVENT_NAME,
+    COUNT_STAR AS total_waits,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms,
+    AVG_TIMER_WAIT / 1000000000 AS avg_wait_ms,
+    MAX_TIMER_WAIT / 1000000000 AS max_wait_ms
+FROM performance_schema.events_waits_summary_global_by_event_name
+WHERE EVENT_NAME LIKE '%aurora_lock_thread_slot_futex%'
+    OR EVENT_NAME LIKE '%aurora%lock%'
+    AND COUNT_STAR > 0;
+
+SELECT '=== RWLOCK WAIT SUMMARY (Top by total wait time) ===' AS section;
+SELECT
+    EVENT_NAME,
+    COUNT_STAR AS total_waits,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms,
+    AVG_TIMER_WAIT / 1000000000 AS avg_wait_ms,
+    MAX_TIMER_WAIT / 1000000000 AS max_wait_ms
+FROM performance_schema.events_waits_summary_global_by_event_name
+WHERE EVENT_NAME LIKE 'wait/synch/rwlock%'
+    AND COUNT_STAR > 0
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 30;
+
+SELECT '=== RWLOCK INSTANCES (Currently Locked) ===' AS section;
+SELECT
+    NAME,
+    OBJECT_INSTANCE_BEGIN,
+    WRITE_LOCKED_BY_THREAD_ID,
+    READ_LOCKED_BY_COUNT
+FROM performance_schema.rwlock_instances
+WHERE WRITE_LOCKED_BY_THREAD_ID IS NOT NULL
+    OR READ_LOCKED_BY_COUNT > 0
+ORDER BY NAME;
+
+SELECT '=== CONDITION VARIABLE WAITS ===' AS section;
+SELECT
+    EVENT_NAME,
+    COUNT_STAR AS total_waits,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms,
+    AVG_TIMER_WAIT / 1000000000 AS avg_wait_ms
+FROM performance_schema.events_waits_summary_global_by_event_name
+WHERE EVENT_NAME LIKE 'wait/synch/cond%'
+    AND COUNT_STAR > 0
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 20;
+
+-- ============================================================================
+-- SECTION 6: DEADLOCK DIAGNOSTICS
+-- ============================================================================
+
+SELECT '=== DEADLOCK COUNT (from InnoDB metrics) ===' AS section;
+SELECT
+    NAME,
+    COUNT,
+    MAX_COUNT,
+    AVG_COUNT,
+    COMMENT
+FROM information_schema.INNODB_METRICS
+WHERE NAME = 'lock_deadlocks';
+
+SELECT '=== ROW LOCK STATISTICS ===' AS section;
+SHOW GLOBAL STATUS LIKE 'Innodb_row_lock_time%';
+SHOW GLOBAL STATUS LIKE 'Innodb_row_lock_waits';
+SHOW GLOBAL STATUS LIKE 'Innodb_row_lock_current_waits';
+
+SELECT '=== INNODB LOCK METRICS (Detailed) ===' AS section;
+SELECT
+    NAME,
+    COUNT,
+    MAX_COUNT,
+    AVG_COUNT,
+    COMMENT
+FROM information_schema.INNODB_METRICS
+WHERE NAME LIKE 'lock_%'
+ORDER BY COUNT DESC;
+
+-- ============================================================================
+-- SECTION 7: WAIT EVENT ANALYSIS (What threads are waiting on)
+-- ============================================================================
+
+SELECT '=== CURRENT WAIT EVENTS (Active Threads) ===' AS section;
+SELECT
+    t.THREAD_ID,
+    t.PROCESSLIST_ID,
+    t.PROCESSLIST_USER,
+    t.PROCESSLIST_DB,
+    t.PROCESSLIST_COMMAND,
+    t.PROCESSLIST_STATE,
+    ew.EVENT_NAME AS wait_event,
+    ew.TIMER_WAIT / 1000000000 AS wait_ms,
+    ew.OBJECT_SCHEMA,
+    ew.OBJECT_NAME,
+    ew.INDEX_NAME,
+    ew.OPERATION
+FROM performance_schema.threads t
+JOIN performance_schema.events_waits_current ew
+    ON t.THREAD_ID = ew.THREAD_ID
+WHERE t.PROCESSLIST_COMMAND != 'Sleep'
+    AND ew.EVENT_NAME != 'idle'
+ORDER BY ew.TIMER_WAIT DESC;
+
+SELECT '=== TOP WAIT EVENTS GLOBALLY ===' AS section;
+SELECT
+    EVENT_NAME,
+    COUNT_STAR AS total_waits,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms,
+    AVG_TIMER_WAIT / 1000000000 AS avg_wait_ms,
+    MAX_TIMER_WAIT / 1000000000 AS max_wait_ms
+FROM performance_schema.events_waits_summary_global_by_event_name
+WHERE EVENT_NAME != 'idle'
+    AND COUNT_STAR > 0
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 30;
+
+SELECT '=== AURORA-SPECIFIC WAIT EVENTS ===' AS section;
+SELECT
+    EVENT_NAME,
+    COUNT_STAR AS total_waits,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms,
+    AVG_TIMER_WAIT / 1000000000 AS avg_wait_ms,
+    MAX_TIMER_WAIT / 1000000000 AS max_wait_ms
+FROM performance_schema.events_waits_summary_global_by_event_name
+WHERE (EVENT_NAME LIKE '%aurora%'
+    OR EVENT_NAME LIKE '%redo_log_flush%')
+    AND COUNT_STAR > 0
+ORDER BY SUM_TIMER_WAIT DESC;
+
+SELECT '=== WAIT EVENTS BY THREAD (Top waiters) ===' AS section;
+SELECT
+    ews.THREAD_ID,
+    t.PROCESSLIST_ID,
+    t.PROCESSLIST_USER,
+    t.PROCESSLIST_DB,
+    ews.EVENT_NAME,
+    ews.COUNT_STAR AS wait_count,
+    ews.SUM_TIMER_WAIT / 1000000000 AS total_wait_ms
+FROM performance_schema.events_waits_summary_by_thread_by_event_name ews
+JOIN performance_schema.threads t ON ews.THREAD_ID = t.THREAD_ID
+WHERE ews.COUNT_STAR > 0
+    AND ews.EVENT_NAME NOT LIKE 'idle'
+    AND t.PROCESSLIST_USER IS NOT NULL
+ORDER BY ews.SUM_TIMER_WAIT DESC
+LIMIT 50;
+
+-- ============================================================================
+-- SECTION 8: STATEMENT & STAGE ANALYSIS
+-- ============================================================================
+
+SELECT '=== CURRENT STAGE EVENTS (What each thread is doing) ===' AS section;
+SELECT
+    t.THREAD_ID,
+    t.PROCESSLIST_ID,
+    t.PROCESSLIST_USER,
+    t.PROCESSLIST_DB,
+    es.EVENT_NAME AS stage,
+    es.TIMER_WAIT / 1000000000 AS stage_wait_ms,
+    es.WORK_COMPLETED,
+    es.WORK_ESTIMATED
+FROM performance_schema.threads t
+JOIN performance_schema.events_stages_current es
+    ON t.THREAD_ID = es.THREAD_ID
+WHERE t.PROCESSLIST_COMMAND != 'Sleep'
+ORDER BY es.TIMER_WAIT DESC;
+
+SELECT '=== TOP STAGES BY WAIT TIME ===' AS section;
+SELECT
+    EVENT_NAME,
+    COUNT_STAR,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms,
+    AVG_TIMER_WAIT / 1000000000 AS avg_wait_ms,
+    MAX_TIMER_WAIT / 1000000000 AS max_wait_ms
+FROM performance_schema.events_stages_summary_global_by_event_name
+WHERE COUNT_STAR > 0
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 20;
+
+SELECT '=== STATEMENTS CURRENTLY RUNNING ===' AS section;
+SELECT
+    t.THREAD_ID,
+    t.PROCESSLIST_ID,
+    t.PROCESSLIST_USER,
+    t.PROCESSLIST_DB,
+    esc.DIGEST_TEXT,
+    esc.TIMER_WAIT / 1000000000 AS elapsed_ms,
+    esc.LOCK_TIME / 1000000000 AS lock_time_ms,
+    esc.ROWS_EXAMINED,
+    esc.ROWS_SENT,
+    esc.ROWS_AFFECTED,
+    esc.CREATED_TMP_TABLES,
+    esc.CREATED_TMP_DISK_TABLES,
+    esc.NO_INDEX_USED,
+    esc.NO_GOOD_INDEX_USED
+FROM performance_schema.threads t
+JOIN performance_schema.events_statements_current esc
+    ON t.THREAD_ID = esc.THREAD_ID
+WHERE t.PROCESSLIST_COMMAND != 'Sleep'
+    AND esc.DIGEST_TEXT IS NOT NULL
+ORDER BY esc.TIMER_WAIT DESC;
+
+SELECT '=== STATEMENTS WITH HIGHEST LOCK TIME (Historical) ===' AS section;
+SELECT
+    DIGEST_TEXT,
+    COUNT_STAR AS exec_count,
+    SUM_LOCK_TIME / 1000000000 AS total_lock_time_ms,
+    AVG_TIMER_WAIT / 1000000000 AS avg_latency_ms,
+    SUM_ROWS_EXAMINED,
+    SUM_ROWS_SENT,
+    FIRST_SEEN,
+    LAST_SEEN
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SUM_LOCK_TIME > 0
+ORDER BY SUM_LOCK_TIME DESC
+LIMIT 20;
+
+SELECT '=== STATEMENTS WITH HIGHEST LATENCY VARIANCE (Contention signal) ===' AS section;
+SELECT
+    DIGEST_TEXT,
+    COUNT_STAR AS exec_count,
+    MIN_TIMER_WAIT / 1000000000 AS min_latency_ms,
+    AVG_TIMER_WAIT / 1000000000 AS avg_latency_ms,
+    MAX_TIMER_WAIT / 1000000000 AS max_latency_ms,
+    (MAX_TIMER_WAIT - MIN_TIMER_WAIT) / 1000000000 AS latency_range_ms,
+    SUM_LOCK_TIME / 1000000000 AS total_lock_time_ms
+FROM performance_schema.events_statements_summary_by_digest
+WHERE COUNT_STAR > 1
+ORDER BY (MAX_TIMER_WAIT - MIN_TIMER_WAIT) DESC
+LIMIT 20;
+
+-- ============================================================================
+-- SECTION 9: GAP LOCKS & NEXT-KEY LOCKS (Critical for parallel issues)
+-- ============================================================================
+
+SELECT '=== GAP LOCKS AND NEXT-KEY LOCKS ===' AS section;
+SELECT
+    ENGINE_TRANSACTION_ID,
+    OBJECT_SCHEMA,
+    OBJECT_NAME,
+    INDEX_NAME,
+    LOCK_TYPE,
+    LOCK_MODE,
+    LOCK_STATUS,
+    LOCK_DATA
+FROM performance_schema.data_locks
+WHERE LOCK_MODE LIKE '%GAP%'
+    OR LOCK_MODE LIKE '%,GAP'
+    OR LOCK_MODE = 'X'
+    OR LOCK_MODE = 'S'
+ORDER BY OBJECT_SCHEMA, OBJECT_NAME, LOCK_DATA;
+
+SELECT '=== LOCK MODE DISTRIBUTION ===' AS section;
+SELECT
+    LOCK_TYPE,
+    LOCK_MODE,
+    LOCK_STATUS,
+    COUNT(*) AS lock_count
+FROM performance_schema.data_locks
+GROUP BY LOCK_TYPE, LOCK_MODE, LOCK_STATUS
+ORDER BY lock_count DESC;
+
+-- ============================================================================
+-- SECTION 10: AUTO-INCREMENT LOCKS (Common parallel insert issue)
+-- ============================================================================
+
+SELECT '=== AUTO-INCREMENT LOCK MODE ===' AS section;
+SELECT @@innodb_autoinc_lock_mode AS autoinc_lock_mode;
+-- 0 = traditional (table-level), 1 = consecutive, 2 = interleaved (best for parallel)
+
+SELECT '=== AUTO-INCREMENT RELATED WAITS ===' AS section;
+SELECT
+    EVENT_NAME,
+    COUNT_STAR,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms
+FROM performance_schema.events_waits_summary_global_by_event_name
+WHERE EVENT_NAME LIKE '%autoinc%'
+    AND COUNT_STAR > 0;
+
+-- ============================================================================
+-- SECTION 11: AURORA-COMPATIBLE INNODB CONFIGURATION
+-- ============================================================================
+
+SELECT '=== INNODB LOCK/CONCURRENCY CONFIGURATION (Aurora-compatible) ===' AS section;
+SELECT
+    @@innodb_lock_wait_timeout AS lock_wait_timeout_sec,
+    @@innodb_deadlock_detect AS deadlock_detect,
+    @@innodb_thread_concurrency AS thread_concurrency,
+    @@innodb_thread_sleep_delay AS thread_sleep_delay_us,
+    @@innodb_spin_wait_delay AS spin_wait_delay,
+    @@innodb_sync_spin_loops AS sync_spin_loops,
+    @@innodb_adaptive_hash_index AS adaptive_hash_index,
+    @@innodb_purge_threads AS purge_threads,
+    @@innodb_flush_log_at_trx_commit AS flush_log_at_trx_commit;
+
+SELECT '=== CONNECTION & THREAD SETTINGS ===' AS section;
+SELECT
+    @@max_connections AS max_connections,
+    @@thread_cache_size AS thread_cache_size,
+    @@table_open_cache AS table_open_cache,
+    @@table_open_cache_instances AS table_open_cache_instances;
+
+SHOW GLOBAL STATUS LIKE 'Threads_%';
+SHOW GLOBAL STATUS LIKE 'Connections';
+SHOW GLOBAL STATUS LIKE 'Max_used_connections';
+
+-- ============================================================================
+-- SECTION 12: AURORA-SPECIFIC STORAGE & LOCK MANAGER METRICS
+-- ============================================================================
+
+SELECT '=== AURORA LOCK MANAGER MEMORY ===' AS section;
+SHOW GLOBAL STATUS LIKE 'Aurora_lockmgr%';
+
+SELECT '=== AURORA COMMIT & STATEMENT LATENCY ===' AS section;
+SHOW GLOBAL STATUS LIKE 'AuroraDb_commit%';
+SHOW GLOBAL STATUS LIKE 'AuroraDb_select_stmt_duration';
+SHOW GLOBAL STATUS LIKE 'AuroraDb_insert_stmt_duration';
+SHOW GLOBAL STATUS LIKE 'AuroraDb_update_stmt_duration';
+SHOW GLOBAL STATUS LIKE 'AuroraDb_delete_stmt_duration';
+SHOW GLOBAL STATUS LIKE 'AuroraDb_ddl_stmt_duration';
+
+SELECT '=== AURORA PARALLEL QUERY METRICS ===' AS section;
+SHOW GLOBAL STATUS LIKE 'Aurora_pq%';
+
+SELECT '=== AURORA WRITE FORWARDING (if using reader for writes) ===' AS section;
+SHOW GLOBAL STATUS LIKE 'Aurora_fwd%';
+
+SELECT '=== AURORA THREAD POOL ===' AS section;
+SHOW GLOBAL STATUS LIKE 'Aurora_thread_pool%';
+
+SELECT '=== AURORA EXTERNAL CONNECTIONS ===' AS section;
+SHOW GLOBAL STATUS LIKE 'Aurora_external%';
+
+-- ============================================================================
+-- SECTION 13: AURORA REDO LOG & STORAGE LAYER WAITS
+-- ============================================================================
+
+SELECT '=== AURORA REDO LOG FLUSH WAITS (Storage layer latency) ===' AS section;
+SELECT
+    EVENT_NAME,
+    COUNT_STAR,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms,
+    AVG_TIMER_WAIT / 1000000000 AS avg_wait_ms,
+    MAX_TIMER_WAIT / 1000000000 AS max_wait_ms
+FROM performance_schema.events_waits_summary_global_by_event_name
+WHERE EVENT_NAME LIKE '%redo_log_flush%'
+    OR EVENT_NAME LIKE '%aurora_redo%'
+    OR EVENT_NAME LIKE '%log%'
+    AND COUNT_STAR > 0
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 15;
+
+SELECT '=== UNDO LOG / HISTORY LIST LENGTH ===' AS section;
+SELECT
+    NAME,
+    COUNT AS value,
+    COMMENT
+FROM information_schema.INNODB_METRICS
+WHERE NAME = 'trx_rseg_history_len';
+
+SHOW GLOBAL STATUS LIKE 'Innodb_history_list_length';
+
+-- ============================================================================
+-- SECTION 14: INNODB METRICS (Lock, Latch, Transaction subsystems)
+-- ============================================================================
+
+SELECT '=== INNODB METRICS - LOCK SUBSYSTEM ===' AS section;
+SELECT
+    NAME,
+    SUBSYSTEM,
+    COUNT,
+    MAX_COUNT,
+    AVG_COUNT,
+    STATUS,
+    COMMENT
+FROM information_schema.INNODB_METRICS
+WHERE SUBSYSTEM = 'lock'
+    AND COUNT > 0
+ORDER BY COUNT DESC;
+
+SELECT '=== INNODB METRICS - TRANSACTION SUBSYSTEM ===' AS section;
+SELECT
+    NAME,
+    SUBSYSTEM,
+    COUNT,
+    MAX_COUNT,
+    AVG_COUNT,
+    STATUS,
+    COMMENT
+FROM information_schema.INNODB_METRICS
+WHERE SUBSYSTEM = 'transaction'
+    AND COUNT > 0
+ORDER BY COUNT DESC;
+
+SELECT '=== INNODB METRICS - ADAPTIVE HASH INDEX ===' AS section;
+SELECT
+    NAME,
+    SUBSYSTEM,
+    COUNT,
+    MAX_COUNT,
+    AVG_COUNT,
+    STATUS,
+    COMMENT
+FROM information_schema.INNODB_METRICS
+WHERE SUBSYSTEM = 'adaptive_hash_index'
+    AND COUNT > 0
+ORDER BY COUNT DESC;
+
+-- ============================================================================
+-- SECTION 15: BUFFER POOL (Aurora-relevant fields only)
+-- ============================================================================
+
+SELECT '=== INNODB BUFFER POOL STATUS ===' AS section;
+SELECT * FROM information_schema.INNODB_BUFFER_POOL_STATS;
+
+-- ============================================================================
+-- SECTION 16: MEMORY & TEMP TABLE CONTENTION
+-- ============================================================================
+
+SELECT '=== MEMORY ALLOCATION EVENTS (Top consumers) ===' AS section;
+SELECT
+    EVENT_NAME,
+    CURRENT_COUNT_USED,
+    CURRENT_NUMBER_OF_BYTES_USED,
+    HIGH_COUNT_USED,
+    HIGH_NUMBER_OF_BYTES_USED
+FROM performance_schema.memory_summary_global_by_event_name
+WHERE CURRENT_NUMBER_OF_BYTES_USED > 1048576
+ORDER BY CURRENT_NUMBER_OF_BYTES_USED DESC
+LIMIT 20;
+
+SELECT '=== TEMP TABLE USAGE ===' AS section;
+SHOW GLOBAL STATUS LIKE 'Created_tmp%';
+
+-- ============================================================================
+-- SECTION 17: FILE I/O (Aurora storage layer perspective)
+-- ============================================================================
+
+SELECT '=== FILE I/O BY EVENT ===' AS section;
+SELECT
+    EVENT_NAME,
+    COUNT_STAR AS total_ops,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms,
+    AVG_TIMER_WAIT / 1000000000 AS avg_wait_ms,
+    MAX_TIMER_WAIT / 1000000000 AS max_wait_ms,
+    SUM_NUMBER_OF_BYTES_READ AS bytes_read,
+    SUM_NUMBER_OF_BYTES_WRITE AS bytes_written
+FROM performance_schema.file_summary_by_event_name
+WHERE COUNT_STAR > 0
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 20;
+
+SELECT '=== FILE I/O BY INSTANCE (Hot Files) ===' AS section;
+SELECT
+    FILE_NAME,
+    EVENT_NAME,
+    COUNT_STAR AS total_ops,
+    SUM_TIMER_WAIT / 1000000000 AS total_wait_ms,
+    COUNT_READ,
+    SUM_TIMER_READ / 1000000000 AS read_wait_ms,
+    COUNT_WRITE,
+    SUM_TIMER_WRITE / 1000000000 AS write_wait_ms
+FROM performance_schema.file_summary_by_instance
+WHERE COUNT_STAR > 0
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 20;
+
+-- ============================================================================
+-- SECTION 18: PREPARED STATEMENTS
+-- ============================================================================
+
+SELECT '=== PREPARED STATEMENT INSTANCES ===' AS section;
+SELECT
+    OBJECT_INSTANCE_BEGIN,
+    STATEMENT_ID,
+    STATEMENT_NAME,
+    LEFT(SQL_TEXT, 200) AS sql_text,
+    OWNER_THREAD_ID,
+    OWNER_EVENT_ID,
+    TIMER_PREPARE / 1000000000 AS prepare_time_ms,
+    COUNT_REPREPARE,
+    COUNT_EXECUTE,
+    SUM_TIMER_EXECUTE / 1000000000 AS total_exec_ms,
+    SUM_LOCK_TIME / 1000000000 AS total_lock_ms,
+    SUM_ROWS_EXAMINED,
+    SUM_ROWS_SENT
+FROM performance_schema.prepared_statements_instances
+ORDER BY SUM_LOCK_TIME DESC
+LIMIT 20;
+
+-- ============================================================================
+-- SECTION 19: TRANSACTION HISTORY
+-- ============================================================================
+
+SELECT '=== ACTIVE TRANSACTION EVENTS ===' AS section;
+SELECT
+    THREAD_ID,
+    EVENT_NAME,
+    STATE,
+    TRX_ID,
+    TIMER_WAIT / 1000000000 AS duration_ms,
+    ACCESS_MODE,
+    ISOLATION_LEVEL,
+    AUTOCOMMIT,
+    NESTING_EVENT_TYPE,
+    NUMBER_OF_SAVEPOINTS,
+    NUMBER_OF_ROLLBACK_TO_SAVEPOINT,
+    NUMBER_OF_RELEASE_SAVEPOINT
+FROM performance_schema.events_transactions_current
+WHERE STATE = 'ACTIVE'
+ORDER BY TIMER_WAIT DESC;
+
+SELECT '=== TRANSACTION SUMMARY BY THREAD ===' AS section;
+SELECT
+    ets.THREAD_ID,
+    t.PROCESSLIST_USER,
+    t.PROCESSLIST_DB,
+    ets.COUNT_STAR AS trx_count,
+    ets.SUM_TIMER_WAIT / 1000000000 AS total_trx_time_ms,
+    ets.AVG_TIMER_WAIT / 1000000000 AS avg_trx_time_ms,
+    ets.MAX_TIMER_WAIT / 1000000000 AS max_trx_time_ms
+FROM performance_schema.events_transactions_summary_by_thread_by_event_name ets
+JOIN performance_schema.threads t ON ets.THREAD_ID = t.THREAD_ID
+WHERE ets.COUNT_STAR > 0
+    AND t.PROCESSLIST_USER IS NOT NULL
+ORDER BY ets.SUM_TIMER_WAIT DESC
+LIMIT 20;
+
+-- ============================================================================
+-- SECTION 20: ERROR & WARNING SUMMARY
+-- ============================================================================
+
+SELECT '=== ERRORS BY THREAD (Lock related) ===' AS section;
+SELECT
+    THREAD_ID,
+    ERROR_NUMBER,
+    ERROR_NAME,
+    SQL_STATE,
+    SUM_ERROR_RAISED,
+    SUM_ERROR_HANDLED,
+    FIRST_SEEN,
+    LAST_SEEN
+FROM performance_schema.events_errors_summary_by_thread_by_error
+WHERE ERROR_NAME IN (
+    'ER_LOCK_WAIT_TIMEOUT',
+    'ER_LOCK_DEADLOCK',
+    'ER_LOCK_TABLE_FULL',
+    'ER_LOCK_ABORTED',
+    'ER_CANT_LOCK',
+    'ER_TABLE_DEF_CHANGED'
+)
+AND SUM_ERROR_RAISED > 0
+ORDER BY LAST_SEEN DESC;
+
+SELECT '=== GLOBAL ERROR SUMMARY (Lock related) ===' AS section;
+SELECT
+    ERROR_NUMBER,
+    ERROR_NAME,
+    SQL_STATE,
+    SUM_ERROR_RAISED,
+    SUM_ERROR_HANDLED,
+    FIRST_SEEN,
+    LAST_SEEN
+FROM performance_schema.events_errors_summary_global_by_error
+WHERE ERROR_NAME IN (
+    'ER_LOCK_WAIT_TIMEOUT',
+    'ER_LOCK_DEADLOCK',
+    'ER_LOCK_TABLE_FULL',
+    'ER_LOCK_ABORTED',
+    'ER_CANT_LOCK',
+    'ER_TABLE_DEF_CHANGED',
+    'ER_QUERY_TIMEOUT'
+)
+AND SUM_ERROR_RAISED > 0;
+
+-- ============================================================================
+-- SECTION 21: SYS SCHEMA VIEWS
+-- ============================================================================
+
+SELECT '=== sys.innodb_lock_waits ===' AS section;
+SELECT * FROM sys.innodb_lock_waits;
+
+SELECT '=== sys.schema_table_lock_waits ===' AS section;
+SELECT * FROM sys.schema_table_lock_waits;
+
+SELECT '=== sys.session (Active sessions with waits) ===' AS section;
+SELECT
+    thd_id,
+    conn_id,
+    user,
+    db,
+    command,
+    state,
+    time,
+    current_statement,
+    rows_examined,
+    rows_sent,
+    tmp_tables,
+    tmp_disk_tables,
+    current_memory
+FROM sys.session
+WHERE command != 'Sleep'
+ORDER BY time DESC;
+
+SELECT '=== sys.statements_with_runtimes_in_95th_percentile ===' AS section;
+SELECT *
+FROM sys.statements_with_runtimes_in_95th_percentile
+ORDER BY avg_latency DESC
+LIMIT 20;
+
+SELECT '=== sys.statements_with_full_table_scans ===' AS section;
+SELECT *
+FROM sys.statements_with_full_table_scans
+ORDER BY total_latency DESC
+LIMIT 20;
+
+-- ============================================================================
+-- SECTION 22: AURORA REPLICA LAG & GLOBAL DB STATUS (if applicable)
+-- ============================================================================
+
+SELECT '=== AURORA REPLICA STATUS ===' AS section;
+SELECT
+    SERVER_ID,
+    SESSION_ID,
+    LAST_UPDATE_TIMESTAMP,
+    REPLICA_LAG_IN_MILLISECONDS,
+    CPU
+FROM information_schema.replica_host_status;
+
+-- ============================================================================
+-- SECTION 23: PERFORMANCE SCHEMA INSTRUMENTATION CHECK
+-- ============================================================================
+
+SELECT '=== ENABLED INSTRUMENTS (Lock/Wait related) ===' AS section;
+SELECT
+    NAME,
+    ENABLED,
+    TIMED
+FROM performance_schema.setup_instruments
+WHERE NAME LIKE '%lock%'
+    OR NAME LIKE '%mutex%'
+    OR NAME LIKE '%rwlock%'
+    OR NAME LIKE '%wait/synch%'
+    OR NAME LIKE '%aurora%'
+ORDER BY ENABLED DESC, NAME
+LIMIT 60;
+
+SELECT '=== ENABLED CONSUMERS ===' AS section;
+SELECT * FROM performance_schema.setup_consumers;
+
+-- ============================================================================
+-- SECTION 24: ENABLE INSTRUMENTS (Run separately if needed)
+-- ============================================================================
+
+-- Uncomment and run these if instruments are disabled:
+-- UPDATE performance_schema.setup_instruments SET ENABLED='YES', TIMED='YES'
+--   WHERE NAME LIKE 'wait/synch/%';
+-- UPDATE performance_schema.setup_instruments SET ENABLED='YES', TIMED='YES'
+--   WHERE NAME LIKE 'wait/lock/%';
+-- UPDATE performance_schema.setup_consumers SET ENABLED='YES'
+--   WHERE NAME LIKE 'events_waits%';
+-- UPDATE performance_schema.setup_consumers SET ENABLED='YES'
+--   WHERE NAME LIKE 'events_stages%';
+-- UPDATE performance_schema.setup_consumers SET ENABLED='YES'
+--   WHERE NAME LIKE 'events_statements%';
+-- UPDATE performance_schema.setup_consumers SET ENABLED='YES'
+--   WHERE NAME LIKE 'events_transactions%';
+
+-- ============================================================================
+-- SECTION 25: RECOMMENDATIONS FOR PARALLEL QUERY ISSUES ON AURORA
+-- ============================================================================
+
+SELECT '=== DIAGNOSTIC SUMMARY & AURORA-SPECIFIC RECOMMENDATIONS ===' AS section;
+SELECT 'Check the following for parallel query contention on Aurora MySQL:' AS recommendation
+UNION ALL
+SELECT '1. GAP/NEXT-KEY locks: check data_locks for wide gap locks blocking parallel DML'
+UNION ALL
+SELECT '2. Isolation level: REPEATABLE-READ creates gap locks; try READ-COMMITTED'
+UNION ALL
+SELECT '3. innodb_autoinc_lock_mode=2 for parallel inserts (interleaved mode)'
+UNION ALL
+SELECT '4. Full table scans: missing indexes cause excess row locks under contention'
+UNION ALL
+SELECT '5. Aurora lock manager memory (Aurora_lockmgr_memory_used): high = many locks held'
+UNION ALL
+SELECT '6. aurora_lock_thread_slot_futex waits: direct signal of row lock contention'
+UNION ALL
+SELECT '7. Aurora redo_log_flush waits: storage layer write latency affecting commits'
+UNION ALL
+SELECT '8. History list length: long-running reads prevent purge, increasing lock footprint'
+UNION ALL
+SELECT '9. Metadata locks: long-running SELECT can block DDL which blocks subsequent DML'
+UNION ALL
+SELECT '10. innodb_deadlock_detect=ON: verify deadlock detection is not disabled'
+UNION ALL
+SELECT '11. innodb_lock_wait_timeout: default 50s; lower it to fail-fast in parallel workloads'
+UNION ALL
+SELECT '12. Check if adaptive hash index causes latch contention (disable with innodb_adaptive_hash_index=OFF)'
+UNION ALL
+SELECT '13. Writer instance only: ensure parallel writes are not hitting a reader (unless write forwarding is configured)'
+UNION ALL
+SELECT '14. Connection count: check if max_connections is being hit causing queuing';
+
+-- ============================================================================
+-- END OF AURORA MYSQL DIAGNOSTIC SCRIPT
+-- ============================================================================
+SELECT '=== DIAGNOSTIC COMPLETE ===' AS section, NOW() AS completed_at_time;
