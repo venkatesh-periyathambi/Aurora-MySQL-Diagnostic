@@ -1,0 +1,52 @@
+==============================================================================
+AURORA MYSQL PARALLEL QUERY TEST - SUMMARY REPORT
+Generated: Thu May  7 08:00:17 UTC 2026
+==============================================================================
+
+AURORA INSTANCE: my-cluster.cluster-xxxxx.eu-west-1.rds.amazonaws.com
+PARALLEL SESSIONS: 100
+TOTAL PARALLEL DURATION: 3929ms
+
+------------------------------------------------------------------------------
+INDIVIDUAL QUERY TIMINGS (5 runs, sequential):
+------------------------------------------------------------------------------
+query_id,duration_ms,exit_code
+1,2327,0
+2,817,0
+3,835,0
+4,688,0
+5,424,0
+
+------------------------------------------------------------------------------
+PARALLEL QUERY STATISTICS:
+------------------------------------------------------------------------------
+Total Queries Launched:  100
+Successful:              100
+Failed:                  0
+Min Latency:             531ms
+Max Latency:             2013ms
+Avg Latency:             1321ms
+P95 Latency:             1873ms
+Total Wall Clock Time:   3929ms
+
+------------------------------------------------------------------------------
+FILES IN THIS REPORT:
+------------------------------------------------------------------------------
+- individual_timings.csv    : Individual run latencies
+- parallel_timings.csv      : All parallel query latencies
+- diagnostics_live.txt      : Live diagnostic snapshots during parallel test
+- pre_parallel_snapshot.txt : Instance state before parallel test
+- post_parallel_snapshot.txt: Instance state after parallel test
+- query_*.txt               : Individual query outputs
+- SUMMARY_REPORT.txt        : This file
+
+------------------------------------------------------------------------------
+INTERPRETATION GUIDE:
+------------------------------------------------------------------------------
+If individual queries are fast but parallel queries are slow, check:
+1. diagnostics_live.txt for lock waits and gap locks
+2. Compare pre/post snapshots for Innodb_row_lock_waits increase
+3. Look for aurora_lock_thread_slot_futex in wait events
+4. Check if LOCK_MODE shows GAP locks (isolation level issue)
+5. Check Aurora_lockmgr_memory_used growth (many locks held)
+==============================================================================

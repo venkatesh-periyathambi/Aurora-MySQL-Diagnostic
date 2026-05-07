@@ -934,39 +934,183 @@ SELECT * FROM performance_schema.setup_consumers;
 --   WHERE NAME LIKE 'events_transactions%';
 
 -- ============================================================================
--- SECTION 25: RECOMMENDATIONS FOR PARALLEL QUERY ISSUES ON AURORA
+-- SECTION 25: DYNAMIC RECOMMENDATIONS (based on current instance state)
 -- ============================================================================
 
-SELECT '=== DIAGNOSTIC SUMMARY & AURORA-SPECIFIC RECOMMENDATIONS ===' AS section;
-SELECT 'Check the following for parallel query contention on Aurora MySQL:' AS recommendation
-UNION ALL
-SELECT '1. GAP/NEXT-KEY locks: check data_locks for wide gap locks blocking parallel DML'
-UNION ALL
-SELECT '2. Isolation level: REPEATABLE-READ creates gap locks; try READ-COMMITTED'
-UNION ALL
-SELECT '3. innodb_autoinc_lock_mode=2 for parallel inserts (interleaved mode)'
-UNION ALL
-SELECT '4. Full table scans: missing indexes cause excess row locks under contention'
-UNION ALL
-SELECT '5. Aurora lock manager memory (Aurora_lockmgr_memory_used): high = many locks held'
-UNION ALL
-SELECT '6. aurora_lock_thread_slot_futex waits: direct signal of row lock contention'
-UNION ALL
-SELECT '7. Aurora redo_log_flush waits: storage layer write latency affecting commits'
-UNION ALL
-SELECT '8. History list length: long-running reads prevent purge, increasing lock footprint'
-UNION ALL
-SELECT '9. Metadata locks: long-running SELECT can block DDL which blocks subsequent DML'
-UNION ALL
-SELECT '10. innodb_deadlock_detect=ON: verify deadlock detection is not disabled'
-UNION ALL
-SELECT '11. innodb_lock_wait_timeout: default 50s; lower it to fail-fast in parallel workloads'
-UNION ALL
-SELECT '12. Check if adaptive hash index causes latch contention (disable with innodb_adaptive_hash_index=OFF)'
-UNION ALL
-SELECT '13. Writer instance only: ensure parallel writes are not hitting a reader (unless write forwarding is configured)'
-UNION ALL
-SELECT '14. Connection count: check if max_connections is being hit causing queuing';
+SELECT '=== DYNAMIC RECOMMENDATIONS (based on detected conditions) ===' AS section;
+
+-- Deadlock analysis
+SELECT '--- DEADLOCK ANALYSIS ---' AS section;
+SELECT
+    CASE
+        WHEN cnt.deadlocks > 50 THEN CONCAT('[CRITICAL] ', cnt.deadlocks, ' deadlocks detected. Immediate action required.')
+        WHEN cnt.deadlocks > 10 THEN CONCAT('[WARNING] ', cnt.deadlocks, ' deadlocks detected. Investigate blocking patterns.')
+        WHEN cnt.deadlocks > 0 THEN CONCAT('[INFO] ', cnt.deadlocks, ' deadlocks detected. Monitor for increase.')
+        ELSE '[OK] No deadlocks detected.'
+    END AS deadlock_status,
+    CASE
+        WHEN cnt.deadlocks > 0 THEN 'REMEDIATION: (1) Run SHOW ENGINE INNODB STATUS and check LATEST DETECTED DEADLOCK section for the exact cycle. (2) Ensure all transactions access tables/rows in the SAME ORDER. (3) Keep transactions short - commit frequently. (4) Add indexes to reduce lock footprint. (5) Consider READ-COMMITTED isolation to eliminate gap locks.'
+        ELSE 'No action needed.'
+    END AS deadlock_remediation
+FROM (SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME = 'lock_deadlocks') cnt(deadlocks);
+
+-- Row lock contention analysis
+SELECT '--- ROW LOCK CONTENTION ANALYSIS ---' AS section;
+SELECT
+    CASE
+        WHEN rlw.VARIABLE_VALUE > 100 THEN CONCAT('[CRITICAL] ', rlw.VARIABLE_VALUE, ' row lock waits. Heavy contention.')
+        WHEN rlw.VARIABLE_VALUE > 20 THEN CONCAT('[WARNING] ', rlw.VARIABLE_VALUE, ' row lock waits. Moderate contention.')
+        WHEN rlw.VARIABLE_VALUE > 0 THEN CONCAT('[INFO] ', rlw.VARIABLE_VALUE, ' row lock waits. Low contention.')
+        ELSE '[OK] No row lock waits.'
+    END AS lock_wait_status,
+    CASE
+        WHEN rlt.VARIABLE_VALUE > 0 THEN CONCAT('Average wait: ', rlt_avg.VARIABLE_VALUE, 'ms | Max wait: ', rlt_max.VARIABLE_VALUE, 'ms')
+        ELSE 'N/A'
+    END AS wait_times,
+    CASE
+        WHEN rlw.VARIABLE_VALUE > 20 THEN 'REMEDIATION: (1) Check data_lock_waits output above for blocking transaction pairs. (2) Identify hot rows/indexes being contended. (3) Reduce transaction duration. (4) Add covering indexes. (5) Consider optimistic locking (retry on deadlock).'
+        ELSE 'No action needed.'
+    END AS lock_remediation
+FROM
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Innodb_row_lock_waits') rlw,
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Innodb_row_lock_time') rlt,
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Innodb_row_lock_time_avg') rlt_avg,
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Innodb_row_lock_time_max') rlt_max;
+
+-- Gap lock analysis
+SELECT '--- GAP LOCK ANALYSIS ---' AS section;
+SELECT
+    CASE
+        WHEN gap_count > 10 THEN CONCAT('[CRITICAL] ', gap_count, ' gap locks detected. These block INSERT_INTENTION locks and cause deadlocks in parallel workloads.')
+        WHEN gap_count > 0 THEN CONCAT('[WARNING] ', gap_count, ' gap locks detected. May cause parallel INSERT/DELETE contention.')
+        ELSE '[OK] No gap locks detected at this moment.'
+    END AS gap_lock_status,
+    CASE
+        WHEN gap_count > 0 AND iso.VARIABLE_VALUE = 'REPEATABLE-READ' THEN 'REMEDIATION: (1) Switch to READ-COMMITTED isolation via DB parameter group (CAUTION: affects all new sessions cluster-wide; test thoroughly first). (2) Use unique/exact-match WHERE clauses instead of ranges. (3) For INSERT-heavy workloads, ensure innodb_autoinc_lock_mode=2.'
+        WHEN gap_count > 0 THEN 'REMEDIATION: (1) Use narrower WHERE clauses. (2) Add indexes covering the search predicates. (3) Avoid DELETE + INSERT patterns (use REPLACE or INSERT ON DUPLICATE KEY UPDATE).'
+        ELSE 'No action needed.'
+    END AS gap_lock_remediation,
+    iso.VARIABLE_VALUE AS current_isolation_level
+FROM
+    (SELECT COUNT(*) AS gap_count FROM performance_schema.data_locks WHERE LOCK_MODE LIKE '%GAP%') gaps,
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_variables WHERE VARIABLE_NAME = 'transaction_isolation') iso;
+
+-- Long transaction analysis
+SELECT '--- LONG TRANSACTION ANALYSIS ---' AS section;
+SELECT
+    CASE
+        WHEN max_age > 60 THEN CONCAT('[CRITICAL] Longest active transaction: ', max_age, 's. Long transactions hold locks and block others.')
+        WHEN max_age > 30 THEN CONCAT('[WARNING] Longest active transaction: ', max_age, 's. May cause lock accumulation.')
+        WHEN max_age > 0 THEN CONCAT('[INFO] Longest active transaction: ', max_age, 's.')
+        ELSE '[OK] No long-running transactions.'
+    END AS long_trx_status,
+    CASE
+        WHEN max_age > 30 THEN 'REMEDIATION: (1) Identify the long transaction from INNODB_TRX output above. (2) Break large transactions into smaller batches. (3) Avoid SELECT ... FOR UPDATE on large result sets. (4) Set innodb_lock_wait_timeout lower (e.g., 10s) to fail fast. (5) Implement application-level retry on ER_LOCK_WAIT_TIMEOUT.'
+        ELSE 'No action needed.'
+    END AS long_trx_remediation,
+    active_count AS active_transactions,
+    total_locked AS total_rows_locked_across_all_trx
+FROM (
+    SELECT
+        COALESCE(MAX(TIMESTAMPDIFF(SECOND, trx_started, NOW())), 0) AS max_age,
+        COUNT(*) AS active_count,
+        COALESCE(SUM(trx_rows_locked), 0) AS total_locked
+    FROM information_schema.INNODB_TRX
+) trx_summary;
+
+-- Lock wait timeout analysis
+SELECT '--- LOCK WAIT TIMEOUT ANALYSIS ---' AS section;
+SELECT
+    CASE
+        WHEN cnt.timeouts > 10 THEN CONCAT('[CRITICAL] ', cnt.timeouts, ' lock wait timeouts. Transactions are failing due to contention.')
+        WHEN cnt.timeouts > 0 THEN CONCAT('[WARNING] ', cnt.timeouts, ' lock wait timeouts detected.')
+        ELSE '[OK] No lock wait timeouts.'
+    END AS timeout_status,
+    CONCAT('Current innodb_lock_wait_timeout = ', @@innodb_lock_wait_timeout, 's') AS current_setting,
+    CASE
+        WHEN cnt.timeouts > 0 THEN 'REMEDIATION: (1) Identify blocking transactions (see data_lock_waits above). (2) Kill long-blocking transactions if acceptable. (3) For parallel batch jobs, lower timeout to 5-10s and implement retry logic. (4) Fix root cause: missing indexes, wide range locks, or long transactions.'
+        ELSE 'No action needed.'
+    END AS timeout_remediation
+FROM (SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME = 'lock_timeouts') cnt(timeouts);
+
+-- Metadata lock analysis
+SELECT '--- METADATA LOCK ANALYSIS ---' AS section;
+SELECT
+    CASE
+        WHEN pending_count > 0 THEN CONCAT('[WARNING] ', pending_count, ' pending metadata locks. DDL is blocked by active transactions.')
+        ELSE '[OK] No pending metadata locks.'
+    END AS mdl_status,
+    CASE
+        WHEN pending_count > 0 THEN 'REMEDIATION: (1) Identify the blocking session holding the MDL (see metadata_locks output above). (2) Wait for the blocking transaction to complete or kill it. (3) Schedule DDL during low-traffic periods. (4) Use pt-online-schema-change or gh-ost for non-blocking DDL.'
+        ELSE 'No action needed.'
+    END AS mdl_remediation
+FROM (
+    SELECT COUNT(*) AS pending_count
+    FROM performance_schema.metadata_locks
+    WHERE LOCK_STATUS = 'PENDING'
+) mdl;
+
+-- Connection/thread saturation
+SELECT '--- CONNECTION SATURATION ANALYSIS ---' AS section;
+SELECT
+    CASE
+        WHEN (tc.VARIABLE_VALUE / @@max_connections * 100) > 90 THEN CONCAT('[CRITICAL] ', tc.VARIABLE_VALUE, '/', @@max_connections, ' connections used (', ROUND(tc.VARIABLE_VALUE / @@max_connections * 100), '%). Near max_connections limit.')
+        WHEN (tc.VARIABLE_VALUE / @@max_connections * 100) > 70 THEN CONCAT('[WARNING] ', tc.VARIABLE_VALUE, '/', @@max_connections, ' connections used (', ROUND(tc.VARIABLE_VALUE / @@max_connections * 100), '%).')
+        ELSE CONCAT('[OK] ', tc.VARIABLE_VALUE, '/', @@max_connections, ' connections used (', ROUND(tc.VARIABLE_VALUE / @@max_connections * 100), '%).')
+    END AS connection_status,
+    CASE
+        WHEN (tc.VARIABLE_VALUE / @@max_connections * 100) > 70 THEN 'REMEDIATION: (1) Increase max_connections in parameter group. (2) Use connection pooling (RDS Proxy, ProxySQL, application-side pool). (3) Close idle connections. (4) Check for connection leaks in application code.'
+        ELSE 'No action needed.'
+    END AS connection_remediation
+FROM (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Threads_connected') tc;
+
+-- History list / purge lag
+SELECT '--- PURGE LAG ANALYSIS ---' AS section;
+SELECT
+    CASE
+        WHEN hll.COUNT > 100000 THEN CONCAT('[CRITICAL] History list length: ', hll.COUNT, '. Purge is severely lagged. Long-running transactions preventing cleanup.')
+        WHEN hll.COUNT > 10000 THEN CONCAT('[WARNING] History list length: ', hll.COUNT, '. Purge lag building up.')
+        ELSE CONCAT('[OK] History list length: ', hll.COUNT, '.')
+    END AS purge_status,
+    CASE
+        WHEN hll.COUNT > 10000 THEN 'REMEDIATION: (1) Identify and terminate long-running read transactions. (2) Avoid long-running mysqldump or reporting queries on the writer. (3) Use a reader instance for long analytical queries. (4) Check innodb_purge_threads (increase if CPU allows).'
+        ELSE 'No action needed.'
+    END AS purge_remediation
+FROM (SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME = 'trx_rseg_history_len') hll;
+
+-- Auto-increment lock mode check
+SELECT '--- AUTO-INCREMENT LOCK MODE ---' AS section;
+SELECT
+    CASE
+        WHEN @@innodb_autoinc_lock_mode = 0 THEN '[CRITICAL] innodb_autoinc_lock_mode=0 (traditional). Table-level lock for every INSERT. Severe bottleneck for parallel inserts.'
+        WHEN @@innodb_autoinc_lock_mode = 1 THEN '[INFO] innodb_autoinc_lock_mode=1 (consecutive). Good for most workloads but holds lock for bulk INSERTs.'
+        ELSE '[OK] innodb_autoinc_lock_mode=2 (interleaved). Best for parallel insert performance.'
+    END AS autoinc_status,
+    CASE
+        WHEN @@innodb_autoinc_lock_mode < 2 THEN 'REMEDIATION: Set innodb_autoinc_lock_mode=2 in parameter group. Safe when using ROW-based replication (Aurora default). Allows concurrent inserts without table-level auto-inc lock.'
+        ELSE 'No action needed.'
+    END AS autoinc_remediation,
+    @@innodb_autoinc_lock_mode AS current_value;
+
+-- Overall summary
+SELECT '--- OVERALL ASSESSMENT ---' AS section;
+SELECT
+    CONCAT(
+        'Deadlocks: ', dl.COUNT,
+        ' | Row lock waits: ', rlw.VARIABLE_VALUE,
+        ' | Lock timeouts: ', lt.COUNT,
+        ' | Active trx: ', trx.cnt,
+        ' | Max trx age: ', trx.max_age, 's',
+        ' | History list: ', hll.COUNT,
+        ' | Threads connected: ', tc.VARIABLE_VALUE, '/', @@max_connections
+    ) AS instance_health_summary
+FROM
+    (SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME = 'lock_deadlocks') dl,
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Innodb_row_lock_waits') rlw,
+    (SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME = 'lock_timeouts') lt,
+    (SELECT COUNT(*) AS cnt, COALESCE(MAX(TIMESTAMPDIFF(SECOND, trx_started, NOW())), 0) AS max_age FROM information_schema.INNODB_TRX) trx,
+    (SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME = 'trx_rseg_history_len') hll,
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Threads_connected') tc;
 
 -- ============================================================================
 -- END OF AURORA MYSQL DIAGNOSTIC SCRIPT

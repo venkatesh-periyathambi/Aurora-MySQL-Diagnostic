@@ -1,0 +1,114 @@
+==============================================================================
+AURORA MYSQL LOCK CONTENTION TEST REPORT
+Generated: Thu May  7 08:01:01 UTC 2026
+==============================================================================
+
+Instance: my-cluster.cluster-xxxxx.eu-west-1.rds.amazonaws.com
+Total Test Duration: 34082ms
+
+==============================================================================
+PER-SCENARIO RESULTS:
+==============================================================================
+
+--- scenario1_update ---
+  Workers: 50 | Success: 39 | Failed: 11
+  Min: 952ms | Avg: 6204ms | Max: 17866ms
+
+--- scenario2_select_for_update ---
+  Workers: 25 | Success: 17 | Failed: 8
+  Min: 7550ms | Avg: 11016ms | Max: 16003ms
+
+--- scenario3_blocker ---
+  Workers: 5 | Success: 3 | Failed: 2
+  Min: 7897ms | Avg: 22725ms | Max: 34077ms
+
+--- scenario4_insert_gap ---
+  Workers: 25 | Success: 11 | Failed: 14
+  Min: 7765ms | Avg: 14649ms | Max: 17702ms
+
+--- scenario5_mixed_rw ---
+  Workers: 25 | Success: 15 | Failed: 10
+  Min: 2355ms | Avg: 3687ms | Max: 5032ms
+
+
+==============================================================================
+KEY METRICS (Pre vs Post):
+==============================================================================
+
+--- PRE-TEST ---
+Variable_name                  Value
+Innodb_row_lock_current_waits  0
+Innodb_row_lock_time           0
+Innodb_row_lock_time_avg       0
+Innodb_row_lock_time_max       0
+Innodb_row_lock_waits          0
+
+Aurora_lockmgr_buffer_pool_memory_used  18048
+Aurora_lockmgr_memory_used              5103592
+
+lock_deadlocks      0
+lock_timeouts       0
+lock_row_lock_waits 0
+
+--- POST-TEST ---
+Variable_name                  Value
+Innodb_row_lock_current_waits  0
+Innodb_row_lock_time           1475004
+Innodb_row_lock_time_avg       4552
+Innodb_row_lock_time_max       30368
+Innodb_row_lock_waits          324
+
+Aurora_lockmgr_buffer_pool_memory_used  5011704
+Aurora_lockmgr_memory_used              25397027
+
+lock_deadlocks      81
+lock_timeouts       3
+lock_row_lock_time  1475004
+lock_row_lock_waits 324
+
+==============================================================================
+STATEMENTS WITH HIGHEST LOCK TIME:
+==============================================================================
+query                                                     execs  lock_ms     avg_ms     max_ms
+UPDATE hot_planning_updates SET counter = counter + ...   100    506624.46   5069.10    18141.29
+SELECT ... FROM hot_planning_updates ... FOR UPDATE       50     369359.93   7388.64    14781.36
+INSERT INTO hot_planning_updates ...                      50     366510.69   7334.22    15146.20
+SELECT * FROM hot_planning_updates WHERE ... FOR UPDATE   10     198975.92   19907.25   30369.35
+UPDATE fact_planningcycle SET planned_sales_qty_tot ...    82     24229.40    307.95     2957.77
+SELECT ... FROM fact_planningcycle ... LOCK IN SHARE MODE 50     4663.55     226.52     1030.95
+UPDATE fact_planningcycle SET forecast_sales_qty ...       50     3455.34     72.52      914.85
+DELETE FROM hot_planning_updates WHERE ...                 50     1186.24     23.98      1186.59
+
+==============================================================================
+ERROR SUMMARY:
+==============================================================================
+ERROR_NAME               SUM_ERROR_RAISED   FIRST_SEEN           LAST_SEEN
+ER_LOCK_DEADLOCK         81                 2026-05-07 08:00:33  2026-05-07 08:00:47
+ER_LOCK_WAIT_TIMEOUT     3                  2026-05-07 08:00:55  2026-05-07 08:00:58
+
+==============================================================================
+FILES:
+==============================================================================
+- contention_timings.csv      : All worker timings with scenario labels
+- lock_diagnostics_live.txt   : Live lock snapshots every 3s during test
+- pre_test_baseline.txt       : Metrics before test
+- post_test_snapshot.txt      : Metrics after test
+- s1_worker_*.txt             : Scenario 1 outputs (concurrent UPDATEs)
+- s2_reader_*.txt             : Scenario 2 outputs (SELECT FOR UPDATE)
+- s3_blocker_*.txt            : Scenario 3 outputs (long blockers)
+- s4_inserter_*.txt           : Scenario 4 outputs (gap lock INSERTs)
+- s5_mixed_*.txt              : Scenario 5 outputs (mixed read/write)
+- CONTENTION_REPORT.txt       : This summary
+
+==============================================================================
+WHAT TO LOOK FOR:
+==============================================================================
+1. lock_diagnostics_live.txt: Look for DATA LOCK WAITS section showing
+   which transactions are blocking which, and what LOCK_MODE/LOCK_DATA
+2. Innodb_row_lock_waits increase = row lock contention occurred
+3. Innodb_row_lock_time increase = how long total spent waiting for locks
+4. lock_deadlocks count > 0 = deadlocks detected
+5. lock_timeouts count > 0 = lock wait timeouts occurred
+6. GAP locks in diagnostics = isolation level causing phantom protection
+7. scenario timing: if avg >> min, contention was the bottleneck
+==============================================================================

@@ -2,8 +2,14 @@
 -- Aurora MySQL Test Setup: Schema, Data, and Indexes
 -- Simulates a retail planning data warehouse with 1M+ fact rows
 -- ============================================================================
--- WARNING: This script DROPS and recreates the 'qldwh' database.
+-- !! DESTRUCTIVE SCRIPT !!
+-- This script DROPS and recreates the 'qldwh' database.
+-- ALL EXISTING DATA IN 'qldwh' WILL BE PERMANENTLY LOST.
 -- DO NOT run on production. For test/dev environments only.
+-- ============================================================================
+-- Safety check: This SELECT will fail if the variable is not set, aborting the script.
+-- Before running, execute: SET @i_confirm_not_production = 1;
+-- Or run with: mysql -e "SET @i_confirm_not_production=1; SOURCE aurora_test_setup.sql"
 -- ============================================================================
 
 DROP DATABASE IF EXISTS qldwh;

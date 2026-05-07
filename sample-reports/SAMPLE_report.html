@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aurora MySQL Diagnostic Report</title>
+<style>
+:root {
+    --bg: #0f1419;
+    --card-bg: #1a2332;
+    --card-border: #2d3748;
+    --text: #e2e8f0;
+    --text-dim: #a0aec0;
+    --accent: #527fff;
+    --green: #48bb78;
+    --yellow: #ecc94b;
+    --orange: #ed8936;
+    --red: #fc8181;
+    --critical-bg: #2d1b1b;
+    --warning-bg: #2d2a1b;
+    --ok-bg: #1b2d1f;
+    --info-bg: #1b2130;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 2rem;
+}
+.container { max-width: 1400px; margin: 0 auto; }
+header {
+    text-align: center;
+    margin-bottom: 3rem;
+    padding: 2rem;
+    background: linear-gradient(135deg, #1a2332 0%, #0f1925 100%);
+    border-radius: 16px;
+    border: 1px solid var(--card-border);
+}
+header h1 {
+    font-size: 2rem;
+    background: linear-gradient(90deg, var(--accent), #a78bfa);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 0.5rem;
+}
+header .subtitle { color: var(--text-dim); font-size: 0.9rem; }
+.badges { display: flex; gap: 1rem; justify-content: center; margin-top: 1rem; flex-wrap: wrap; }
+.badge {
+    padding: 0.3rem 0.8rem;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+.badge-aurora { background: #527fff33; color: var(--accent); border: 1px solid var(--accent); }
+.badge-version { background: #48bb7833; color: var(--green); border: 1px solid var(--green); }
+.badge-time { background: #a78bfa33; color: #a78bfa; border: 1px solid #a78bfa; }
+.section {
+    margin-bottom: 2rem;
+    background: var(--card-bg);
+    border-radius: 12px;
+    border: 1px solid var(--card-border);
+    overflow: hidden;
+}
+.section-header {
+    padding: 1rem 1.5rem;
+    background: linear-gradient(90deg, #1e293b, #1a2332);
+    border-bottom: 1px solid var(--card-border);
+    font-size: 1rem;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.section-body { padding: 1.5rem; }
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+}
+th {
+    text-align: left;
+    padding: 0.6rem 0.8rem;
+    background: #2d3748;
+    color: var(--accent);
+    font-weight: 600;
+    border-bottom: 2px solid var(--accent);
+    white-space: nowrap;
+}
+td {
+    padding: 0.5rem 0.8rem;
+    border-bottom: 1px solid #2d374855;
+    word-break: break-word;
+}
+tr:hover td { background: #2d374833; }
+.severity-critical {
+    background: var(--critical-bg);
+    border-left: 4px solid var(--red);
+    padding: 1rem 1.5rem;
+    margin: 0.5rem 0;
+    border-radius: 8px;
+}
+.severity-warning {
+    background: var(--warning-bg);
+    border-left: 4px solid var(--yellow);
+    padding: 1rem 1.5rem;
+    margin: 0.5rem 0;
+    border-radius: 8px;
+}
+.severity-ok {
+    background: var(--ok-bg);
+    border-left: 4px solid var(--green);
+    padding: 1rem 1.5rem;
+    margin: 0.5rem 0;
+    border-radius: 8px;
+}
+.severity-info {
+    background: var(--info-bg);
+    border-left: 4px solid var(--accent);
+    padding: 1rem 1.5rem;
+    margin: 0.5rem 0;
+    border-radius: 8px;
+}
+.severity-label {
+    font-weight: 700;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    margin-bottom: 0.3rem;
+}
+.severity-critical .severity-label { color: var(--red); }
+.severity-warning .severity-label { color: var(--yellow); }
+.severity-ok .severity-label { color: var(--green); }
+.severity-info .severity-label { color: var(--accent); }
+.remediation {
+    margin-top: 0.8rem;
+    padding: 0.8rem 1rem;
+    background: #0f141966;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    color: var(--text-dim);
+}
+.remediation strong { color: var(--orange); }
+.metric-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem;
+}
+.metric-card {
+    padding: 1rem;
+    background: #0f1419;
+    border-radius: 8px;
+    border: 1px solid var(--card-border);
+    text-align: center;
+}
+.metric-value {
+    font-size: 1.8rem;
+    font-weight: 700;
+    margin: 0.3rem 0;
+}
+.metric-label { font-size: 0.7rem; color: var(--text-dim); text-transform: uppercase; }
+.metric-value.critical { color: var(--red); }
+.metric-value.warning { color: var(--yellow); }
+.metric-value.ok { color: var(--green); }
+.summary-bar {
+    padding: 1rem 1.5rem;
+    background: linear-gradient(90deg, #1e293b, #2d3748);
+    border-radius: 8px;
+    margin-bottom: 2rem;
+    font-size: 0.85rem;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+.collapsible { cursor: pointer; }
+.collapsible-content { display: none; }
+.collapsible-content.show { display: block; }
+.toggle-icon { float: right; color: var(--text-dim); }
+pre {
+    background: #0f1419;
+    padding: 1rem;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 0.75rem;
+    border: 1px solid var(--card-border);
+}
+.instrumentation-note {
+    background: #2d2a1b;
+    border: 1px solid #ecc94b55;
+    border-radius: 8px;
+    padding: 1rem 1.5rem;
+    margin-bottom: 2rem;
+    font-size: 0.85rem;
+}
+.instrumentation-note strong { color: var(--yellow); }
+footer {
+    text-align: center;
+    margin-top: 3rem;
+    padding: 1.5rem;
+    color: var(--text-dim);
+    font-size: 0.75rem;
+    border-top: 1px solid var(--card-border);
+}
+</style>
+</head>
+<body>
+<div class="container">
+<header>
+    <h1>Aurora MySQL Diagnostic Report</h1>
+    <p class="subtitle">Lock Contention, Deadlocks &amp; Performance Schema Analysis</p>
+    <div class="badges">
+        <span class="badge badge-aurora">Aurora MySQL 3.11.1</span>
+        <span class="badge badge-version">MySQL 8.0.43 | Writer Instance</span>
+        <span class="badge badge-time">2026-05-07 10:05:27 UTC</span>
+    </div>
+</header>
+<div class="instrumentation-note">
+    <strong>⚠ Performance Schema Instrumentation Status</strong><br>
+    <p style="margin-top:0.5rem; color:var(--green)">✓ All wait/synch instruments are enabled. Full diagnostic data available.</p>
+    <p style="margin-top:0.5rem"><span style="color:var(--orange)">Disabled consumers:</span> <code style="font-size:0.75rem">events_stages_current, events_stages_history, events_stages_history_long, events_statements_cpu, events_statements_history_long, events_transactions_history_long, events_waits_history, events_waits_history_long</code></p>
+</div>
+<div class="section">
+    <div class="section-header">📊 Instance Health Summary</div>
+    <div class="section-body">
+        <div class="metric-grid">
+            <div class="metric-card">
+                <div class="metric-label">Deadlocks</div>
+                <div class="metric-value critical">81</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Row Lock Waits</div>
+                <div class="metric-value critical">324</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Current Waits</div>
+                <div class="metric-value ok">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Max Wait (ms)</div>
+                <div class="metric-value critical">30368</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Lock Timeouts</div>
+                <div class="metric-value warning">3</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Gap Locks</div>
+                <div class="metric-value ok">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Active Transactions</div>
+                <div class="metric-value ok">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Longest Trx (sec)</div>
+                <div class="metric-value ok">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Connections</div>
+                <div class="metric-value ok">8 / 5000</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">History List</div>
+                <div class="metric-value ok">9392</div>
+            </div>
+        </div>
+    </div>
+</div>
+<div class="section">
+    <div class="section-header">🔍 Dynamic Recommendations</div>
+    <div class="section-body">
+    <div class="severity-critical">
+        <div class="severity-label">CRITICAL — Deadlocks: 81</div>
+        <p>High deadlock rate indicates circular lock dependencies between concurrent transactions.</p>
+        <div class="remediation">
+            <strong>Remediation:</strong><br>
+            1. Run <code>SHOW ENGINE INNODB STATUS</code> → check LATEST DETECTED DEADLOCK for the exact cycle<br>
+            2. Ensure all transactions access tables and rows in the <strong>same order</strong><br>
+            3. Keep transactions short — commit after each logical unit of work<br>
+            4. Add indexes to reduce the number of rows locked per statement<br>
+            5. Switch to <code>READ-COMMITTED</code> isolation to eliminate gap locks<br>
+            6. Implement application retry logic for <code>ER_LOCK_DEADLOCK</code> (error 1213)
+        </div>
+    </div>
+    <div class="severity-critical">
+        <div class="severity-label">CRITICAL — Row Lock Waits: 324 (Max: 30368ms)</div>
+        <p>Heavy row lock contention. Parallel queries are blocking each other.</p>
+        <div class="remediation">
+            <strong>Remediation:</strong><br>
+            1. Check <code>performance_schema.data_lock_waits</code> to identify blocking transaction pairs<br>
+            2. Identify hot rows/indexes being contended (look at LOCK_DATA values)<br>
+            3. Reduce transaction duration — don't hold locks while doing application processing<br>
+            4. Add covering indexes to reduce the number of rows examined/locked<br>
+            5. Use optimistic locking patterns with retry on conflict<br>
+            6. For read-heavy workloads, use <code>SELECT ... WITH (NOLOCK)</code> or read from Aurora reader instance
+        </div>
+    </div>
+    <div class="severity-ok">
+        <div class="severity-label">OK — No Gap Locks (Isolation: REPEATABLE-READ)</div>
+        <p>No gap locks detected at this moment.</p>
+    </div>
+    <div class="severity-ok">
+        <div class="severity-label">OK — No Long Transactions (max: 0s, 0 active)</div>
+        <p>All transactions are running within acceptable duration.</p>
+    </div>
+    <div class="severity-warning">
+        <div class="severity-label">WARNING — Lock Wait Timeouts: 3 (timeout: 50s)</div>
+        <p>Transactions exceeded the lock wait timeout and were rolled back.</p>
+        <div class="remediation">
+            <strong>Remediation:</strong><br>
+            1. Identify blocking transactions from <code>data_lock_waits</code> output<br>
+            2. Kill long-blocking transactions if business-acceptable<br>
+            3. For parallel batch jobs: lower timeout to 5-10s + implement retry<br>
+            4. Fix root cause: missing indexes, wide range locks, or long transactions
+        </div>
+    </div>
+</div></div>
+<div class="section">
+    <div class="section-header">⏱ Top Wait Events (Performance Schema)</div>
+    <div class="section-body">
+        <table>
+            <tr><th>Wait Event</th><th>Count</th><th>Total (ms)</th><th>Avg (ms)</th></tr>
+            <tr><td style="color:var(--yellow)">wait/synch/cond/innodb/row_lock_wait</td><td>324</td><td>1482364.69</td><td>4575.20</td></tr>
+            <tr><td >wait/io/table/sql/handler</td><td>12948817</td><td>873152.30</td><td>0.07</td></tr>
+            <tr><td >wait/synch/cond/sql/Item_func_sleep::cond</td><td>153</td><td>198579.88</td><td>1297.91</td></tr>
+            <tr><td style="color:var(--yellow)">wait/synch/sxlock/innodb/hash_table_locks</td><td>1507583737</td><td>67628.24</td><td>0.00</td></tr>
+            <tr><td >wait/synch/mutex/innodb/undo_space_rseg_mutex</td><td>746162914</td><td>24519.28</td><td>0.00</td></tr>
+            <tr><td >wait/io/socket/sql/client_connection</td><td>1643837</td><td>20098.99</td><td>0.01</td></tr>
+            <tr><td style="color:var(--yellow)">wait/synch/sxlock/innodb/index_tree_rw_lock</td><td>12741605</td><td>3429.13</td><td>0.00</td></tr>
+            <tr><td >wait/synch/mutex/innodb/srv_sys_mutex</td><td>1570537</td><td>2625.64</td><td>0.00</td></tr>
+            <tr><td >wait/io/file/sql/binlog_index</td><td>931</td><td>1541.07</td><td>1.66</td></tr>
+            <tr><td style="color:var(--yellow)">wait/synch/sxlock/innodb/lock_sys_global_rw_lock</td><td>15558577</td><td>927.94</td><td>0.00</td></tr>
+            <tr><td >wait/io/redo_log_flush</td><td>188</td><td>748.25</td><td>3.98</td></tr>
+            <tr><td >wait/synch/mutex/innodb/temp_space_rseg_mutex</td><td>10165376</td><td>746.17</td><td>0.00</td></tr>
+            <tr><td >wait/synch/mutex/innodb/trx_mutex</td><td>4655082</td><td>559.63</td><td>0.00</td></tr>
+            <tr><td style="color:var(--yellow)">wait/synch/mutex/innodb/lock_sys_page_mutex</td><td>15603859</td><td>554.70</td><td>0.00</td></tr>
+            <tr><td >wait/synch/mutex/innodb/fil_system_mutex</td><td>9226971</td><td>439.91</td><td>0.00</td></tr>
+</table></div></div>
+<div class="section">
+    <div class="section-header">📝 Statements with Highest Lock Time</div>
+    <div class="section-body">
+        <table>
+            <tr><th>Query (truncated)</th><th>Execs</th><th>Lock Time (ms)</th><th>Avg (ms)</th><th>Max (ms)</th></tr>
+            <tr><td><code>UPDATE `qldwh` . `hot_planning_updates` SET `counter` = `counter` + ? , `amount` = `amount` + `ROUND</code></td><td>100</td><td style="color:var(--orange)">506624.46</td><td>5069.10</td><td>18141.29</td></tr>
+            <tr><td><code>SELECT `dim_position_id` , `planning_cycle_id` , SUM ( `amount` ) AS `total` FROM `qldwh` . `hot_pla</code></td><td>50</td><td style="color:var(--orange)">369359.93</td><td>7388.64</td><td>14781.36</td></tr>
+            <tr><td><code>INSERT INTO `qldwh` . `hot_planning_updates` ( `dim_position_id` , `planning_cycle_id` , `retailbran</code></td><td>50</td><td style="color:var(--orange)">366510.69</td><td>7334.22</td><td>15146.20</td></tr>
+            <tr><td><code>SELECT * FROM `qldwh` . `hot_planning_updates` WHERE `dim_position_id` BETWEEN ? AND ? FOR UPDATE</code></td><td>10</td><td style="color:var(--orange)">198975.92</td><td>19907.25</td><td>30369.35</td></tr>
+            <tr><td><code>UPDATE `qldwh` . `fact_planningcycle` SET `planned_sales_qty_tot` = `planned_sales_qty_tot` + `ROUND</code></td><td>82</td><td style="color:var(--orange)">24229.40</td><td>307.95</td><td>2957.77</td></tr>
+            <tr><td><code>SELECT `dim_position_id` , `planning_cycle_id` , `retailbrand_id` , SUM ( `planned_sales_qty_tot` ) </code></td><td>50</td><td style="color:var(--orange)">4663.55</td><td>226.52</td><td>1030.95</td></tr>
+            <tr><td><code>UPDATE `qldwh` . `fact_planningcycle` SET `forecast_sales_qty` = `planned_sales_qty_tot` * ( ? + `RA</code></td><td>50</td><td style="color:var(--orange)">3455.34</td><td>72.52</td><td>914.85</td></tr>
+            <tr><td><code>DELETE FROM `qldwh` . `hot_planning_updates` WHERE `dim_position_id` = ? AND `planning_cycle_id` = ?</code></td><td>50</td><td style="color:var(--orange)">1186.24</td><td>23.98</td><td>1186.59</td></tr>
+            <tr><td><code>INSERT INTO `mysql` . `rds_heartbeat2` ( `id` , VALUE ) VALUES (...) ON DUPLICATE KEY UPDATE VALUE =</code></td><td>19817</td><td style="color:var(--orange)">52.51</td><td>1.36</td><td>4.44</td></tr>
+            <tr><td><code>SELECT `durable_lsn` , `current_read_point` , `server_id` , `last_update_timestamp` FROM `informatio</code></td><td>41942</td><td style="color:var(--orange)">15.92</td><td>0.13</td><td>0.26</td></tr>
+</table></div></div>
+<div class="section">
+    <div class="section-header">☁️ Aurora-Specific Metrics</div>
+    <div class="section-body">
+        <table>
+            <tr><th>Metric</th><th>Value</th></tr>
+            <tr><td>Aurora_lockmgr_buffer_pool_memory_used</td><td>5011704</td></tr>
+            <tr><td>Aurora_lockmgr_memory_used</td><td>25397027</td></tr>
+</table></div></div>
+<footer>
+    Generated by Aurora MySQL Diagnostic Toolkit | Instance: demo (Writer) |
+    Aurora 3.11.1 | 2026-05-07 10:05:27 UTC
+</footer>
+</div>
+<script>
+document.querySelectorAll('.collapsible').forEach(el => {
+    el.addEventListener('click', () => {
+        el.nextElementSibling.classList.toggle('show');
+    });
+});
+</script>
+</body>
+</html>

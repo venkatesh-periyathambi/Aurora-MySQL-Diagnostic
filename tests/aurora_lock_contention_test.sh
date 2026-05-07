@@ -30,6 +30,26 @@ if [ -z "$MYSQL_PWD" ]; then
     fi
 fi
 
+# Safety check: prevent accidental execution on production
+if [ "${I_CONFIRM_THIS_IS_NOT_PRODUCTION:-}" != "yes" ]; then
+    echo "=============================================="
+    echo " WARNING: This script MODIFIES DATA"
+    echo "=============================================="
+    echo ""
+    echo " It will:"
+    echo "   - DROP and CREATE tables"
+    echo "   - INSERT/UPDATE/DELETE rows"
+    echo "   - Generate heavy lock contention and deadlocks"
+    echo ""
+    echo " DO NOT RUN ON PRODUCTION."
+    echo ""
+    echo " To confirm this is a test environment, run:"
+    echo "   export I_CONFIRM_THIS_IS_NOT_PRODUCTION=yes"
+    echo "   bash $0"
+    echo ""
+    exit 1
+fi
+
 mkdir -p "$OUTPUT_DIR"
 
 MYSQL_CMD="mysql -h $AURORA_HOST -u $AURORA_USER $DB"

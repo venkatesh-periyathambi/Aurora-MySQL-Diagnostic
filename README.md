@@ -38,8 +38,10 @@ This toolkit helps you:
 aurora-diagnostic/
 │
 ├── diagnostics/                                    ← Production-safe diagnostic scripts
-│   ├── aurora_mysql_diagnostic_locks_latches.sql   ← Aurora MySQL 3.x (25 sections)
-│   └── mysql_diagnostic_locks_latches.sql          ← Community MySQL 8.0/8.4
+│   ├── aurora_mysql_diagnostic_locks_latches.sql   ← Aurora MySQL 3.x (25 sections + recommendations)
+│   ├── mysql_diagnostic_locks_latches.sql          ← Community MySQL 8.0/8.4
+│   ├── enable_instrumentation.sql                  ← Enable full performance_schema instrumentation
+│   └── generate_html_report.sh                     ← Colourful HTML report with recommendations
 │
 ├── tests/                                          ← Stress test & simulation scripts
 │   ├── aurora_test_setup.sql                       ← Creates test schema + 1.2M rows
@@ -50,6 +52,14 @@ aurora-diagnostic/
 │   ├── linux_cron_setup.sh                         ← Interactive cron installer script
 │   ├── linux_systemd_timer.md                      ← Systemd timer setup guide
 │   └── windows_task_scheduler.md                   ← Windows Task Scheduler guide
+│
+├── sample-reports/                                 ← Example outputs from real test runs
+│   ├── SAMPLE_report.html                          ← HTML report (open in browser)
+│   ├── SAMPLE_dynamic_recommendations.txt          ← Auto-generated recommendations
+│   ├── SAMPLE_parallel_query_report.txt            ← Parallel test summary
+│   ├── SAMPLE_lock_contention_report.txt           ← Lock contention test summary
+│   ├── SAMPLE_live_lock_diagnostics.txt            ← Live lock capture (blocking chains)
+│   └── SAMPLE_diagnostic_output.txt                ← Full diagnostic script output
 │
 ├── README.md
 └── .gitignore
@@ -153,6 +163,154 @@ mysql -u root -p mydb \
 
 ---
 
+## When to Use This vs AWS Performance Insights
+
+> **If you're an AWS customer, start with Performance Insights (PI) — it's free and pre-built. Use this toolkit when PI shows you THAT there's a problem but you need to understand WHY.**
+
+<table>
+<tr>
+<th width="50%">
+
+### <img src="https://img.shields.io/badge/-Performance_Insights-FF9900?style=flat-square&logo=amazon-aws&logoColor=white"/> Use PI When...
+
+</th>
+<th width="50%">
+
+### <img src="https://img.shields.io/badge/-This_Toolkit-527FFF?style=flat-square&logo=mysql&logoColor=white"/> Use This When...
+
+</th>
+</tr>
+<tr>
+<td>
+
+- Checking if DB is bottlenecked on locks vs CPU vs I/O
+- Finding which SQL contributes most to lock wait load
+- Trend analysis ("did contention increase after deployment?")
+- After-the-fact investigation ("what happened at 3 AM?")
+- Capacity planning (AAS vs vCPU count)
+- Non-DBA teams need visibility (console UI, no SQL needed)
+
+</td>
+<td>
+
+- Application is hung NOW — need exact blocking chain to kill the right session
+- Deadlocks spiking — need the exact cycle to fix application logic
+- Suspect gap locks — need `LOCK_MODE` detail (GAP vs REC_NOT_GAP vs INSERT_INTENTION)
+- ALTER TABLE is hanging — need to find who holds the metadata lock
+- Need to know which specific rows are hot (`LOCK_DATA`)
+- Want automated recommendations with remediation steps
+
+</td>
+</tr>
+</table>
+
+### What Performance Insights CANNOT show you:
+
+| Information needed | PI | This toolkit |
+|-------------------|:--:|:------------:|
+| Exact blocking chain (PID 42 blocks PID 78) | No | **Yes** |
+| Specific locked row (primary key value) | No | **Yes** |
+| Gap lock vs record lock vs next-key lock | No | **Yes** |
+| Deadlock cycle details (both transactions + locks) | No | **Yes** |
+| Metadata lock holders (who blocks DDL) | No | **Yes** |
+| INSERT_INTENTION lock waits | No | **Yes** |
+| `sys.innodb_lock_waits` (formatted kill commands) | No | **Yes** |
+| Severity-rated remediation recommendations | No | **Yes** |
+| Point-in-time snapshot of ALL current locks | No | **Yes** |
+| Historical load trend over days/weeks | **Yes** | No |
+| AAS by wait type (time-series graph) | **Yes** | No |
+| Top SQL by database load | **Yes** | No |
+| CloudWatch alarm integration | **Yes** | No |
+
+### Recommended Workflow (Use Both Together)
+
+```
+1. PI alerts (CloudWatch alarm on DBLoadNonCPU) → lock contention detected
+2. PI console → identify time window, confirm it's lock waits, find top SQL
+3. ⬇️ Pivot to this toolkit ⬇️
+4. Run diagnostic script → get blocking chain, lock types, gap locks
+5. Read recommendations → identify root cause + fix
+6. Remediate (kill blocker, add index, change isolation, fix app logic)
+7. PI → confirm load returned to normal post-fix
+```
+
+### Performance Insights Pricing
+
+| Tier | Retention | Cost |
+|------|-----------|------|
+| Free (included with Aurora) | 7 days | $0 |
+| Long-term retention | 2 years (731 days) | ~$0.06/vCPU/month |
+
+PI is automatically enabled on Aurora. The free tier is sufficient for most troubleshooting.
+
+---
+
+## Performance Schema Instrumentation (Important!)
+
+> **Without proper instrumentation, mutex/rwlock/cond wait data will be MISSING from your reports.**
+
+Aurora MySQL 3.x has most `wait/synch/*` instruments **DISABLED by default**. You need to enable them for full visibility.
+
+### What's enabled by default?
+
+| Instrument Family | Default | Data you get |
+|-------------------|---------|-------------|
+| `wait/synch/mutex/*` | **DISABLED** | Mutex contention (lock_sys, trx_sys, etc.) |
+| `wait/synch/rwlock/*` | **DISABLED** | Read-write lock contention |
+| `wait/synch/cond/*` | **DISABLED** | Condition variable waits (row_lock_wait!) |
+| `wait/lock/*` | Enabled | Table/metadata lock waits |
+| `wait/io/*` | Enabled | I/O waits (Aurora storage layer) |
+| `stage/*` | **DISABLED** | What each thread is doing (stages) |
+| `statement/*` | Enabled | Query execution stats |
+| `transaction/*` | Enabled | Transaction stats |
+
+| Consumer | Default | What it collects |
+|----------|---------|-----------------|
+| `events_waits_current` | **DISABLED** | Current wait per thread |
+| `events_waits_history` | **DISABLED** | Recent waits per thread |
+| `events_stages_current` | **DISABLED** | Current stage per thread |
+| `events_statements_current` | Enabled | Current statement per thread |
+| `events_transactions_current` | Enabled | Current transaction per thread |
+
+### Quick fix: Enable instrumentation
+
+```bash
+# Run the provided enablement script (immediate, no reboot needed)
+mysql -h <aurora-endpoint> -u <user> < diagnostics/enable_instrumentation.sql
+```
+
+### Persistent fix: Aurora DB parameter group
+
+Add these to your cluster parameter group (requires reboot):
+
+```
+performance_schema = 1
+performance-schema-instrument = 'wait/%=ON'
+performance-schema-consumer-events-waits-current = ON
+performance-schema-consumer-events-waits-history = ON
+performance-schema-consumer-events-stages-current = ON
+performance-schema-consumer-events-stages-history = ON
+```
+
+### If using Performance Insights
+
+When Performance Insights manages performance_schema automatically (default), it enables:
+- All `wait/%` instruments
+- `events_waits_current` consumer
+
+This is sufficient for most diagnostics. The HTML report will warn you if instrumentation is missing.
+
+### Important restrictions
+
+| Constraint | Detail |
+|-----------|--------|
+| **T-class instances** | Do NOT enable performance_schema on db.t2/t3/t4g — risk of OOM |
+| **CPU overhead** | ~5-10% with all wait/synch instruments enabled |
+| **Memory** | Auto-sized via `performance_schema_max_*` parameters; monitor with CloudWatch |
+| **Reboot required** | Only for enabling `performance_schema` itself; instrument/consumer changes are immediate |
+
+---
+
 ## Quick Start
 
 ### Prerequisites
@@ -161,6 +319,7 @@ mysql -u root -p mydb \
 - Network access to your Aurora cluster (or MySQL instance)
 - User with `SELECT` on `performance_schema` + `PROCESS` privilege
 - `performance_schema = 1` enabled in Aurora parameter group
+- For full visibility: run `enable_instrumentation.sql` (see above)
 
 ### 1. Clone and Deploy
 
@@ -198,6 +357,22 @@ bash tests/aurora_parallel_test.sh
 ```bash
 # Edit script header to set AURORA_HOST, AURORA_USER, password
 bash tests/aurora_lock_contention_test.sh
+```
+
+### 6. Generate HTML Report (colourful, with recommendations)
+
+```bash
+export AURORA_HOST='your-cluster-endpoint'
+export AURORA_USER='your-user'
+export MYSQL_PWD='your-password'
+export AURORA_DB='your-database'
+bash diagnostics/generate_html_report.sh
+
+# Opens a dark-themed HTML report with:
+# - Colour-coded severity metrics (green/yellow/red)
+# - Dynamic recommendations based on actual instance state
+# - Instrumentation status warnings
+# - Top wait events, blocking pairs, lock-heavy statements
 ```
 
 ---
@@ -351,6 +526,44 @@ schtasks /create /tn "Aurora Diagnostic" `
 
 ---
 
+## Dynamic Recommendations Engine (Section 25)
+
+The diagnostic script doesn't just collect data — it **analyzes the current state and outputs actionable recommendations** with severity levels:
+
+```
+--- DEADLOCK ANALYSIS ---
+  [CRITICAL] 81 deadlocks detected. Immediate action required.
+  REMEDIATION: (1) Run SHOW ENGINE INNODB STATUS... (2) Ensure same access order...
+
+--- ROW LOCK CONTENTION ANALYSIS ---
+  [CRITICAL] 324 row lock waits. Heavy contention.
+  Average wait: 4552ms | Max wait: 30368ms
+  REMEDIATION: (1) Check data_lock_waits... (2) Identify hot rows...
+
+--- GAP LOCK ANALYSIS ---
+  [WARNING] 29 gap locks detected. Current isolation: REPEATABLE-READ
+  REMEDIATION: (1) Switch to READ-COMMITTED... (2) Use exact-match WHERE...
+
+--- OVERALL ASSESSMENT ---
+  Deadlocks: 81 | Row lock waits: 324 | Lock timeouts: 3 | Active trx: 74 | Max trx age: 45s
+```
+
+**Checks performed automatically:**
+
+| Check | Severity Thresholds | Remediation Provided |
+|-------|---------------------|---------------------|
+| Deadlocks | >50 CRITICAL, >10 WARNING | Access order, indexes, isolation level |
+| Row lock waits | >100 CRITICAL, >20 WARNING | Blocking pair ID, hot row detection |
+| Gap locks | >10 CRITICAL, >0 WARNING | Isolation switch, WHERE clause tuning |
+| Long transactions | >60s CRITICAL, >30s WARNING | Batch splitting, timeout tuning |
+| Lock wait timeouts | >10 CRITICAL, >0 WARNING | Root cause, retry logic |
+| Metadata locks | Any pending = WARNING | DDL scheduling, pt-osc |
+| Connection saturation | >90% CRITICAL, >70% WARNING | Pooling, max_connections |
+| Purge lag | >100K CRITICAL, >10K WARNING | Long-read termination, reader offload |
+| Auto-increment mode | Mode 0 = CRITICAL | Switch to mode 2 |
+
+---
+
 ## Interpreting Results
 
 ### Red Flags in Diagnostic Output
@@ -378,21 +591,39 @@ schtasks /create /tn "Aurora Diagnostic" `
 
 ---
 
+## Sample Reports
+
+The [`sample-reports/`](sample-reports/) directory contains real outputs from test runs on Aurora MySQL 3.11.1, so you can see exactly what to expect:
+
+| File | Shows |
+|------|-------|
+| [`SAMPLE_parallel_query_report.txt`](sample-reports/SAMPLE_parallel_query_report.txt) | Parallel test: individual vs 100 concurrent queries, latency stats |
+| [`SAMPLE_lock_contention_report.txt`](sample-reports/SAMPLE_lock_contention_report.txt) | Lock test: per-scenario results, pre/post metrics, deadlock counts |
+| [`SAMPLE_live_lock_diagnostics.txt`](sample-reports/SAMPLE_live_lock_diagnostics.txt) | Live capture: blocking chains, gap locks, wait events during contention |
+| [`SAMPLE_diagnostic_output.txt`](sample-reports/SAMPLE_diagnostic_output.txt) | Full diagnostic: all 25 sections with Aurora-specific metrics |
+| [`SAMPLE_dynamic_recommendations.txt`](sample-reports/SAMPLE_dynamic_recommendations.txt) | **Auto-generated recommendations** with severity and remediation steps |
+
+---
+
 ## Security Notes
 
 > **🟢 Diagnostic scripts are read-only** (SELECT/SHOW only) — safe for production use.
 
 > **🔴 Test scripts modify data** (INSERT/UPDATE/DELETE) — use on test environments only.
 
-For credential management:
+For credential management (in order of preference):
 
-| Method | Platform | Security Level |
-|--------|----------|----------------|
-| `MYSQL_PWD` env var | Linux/Windows | Basic (not in `ps` output) |
-| `~/.my.cnf` (chmod 600) | Linux | Good |
-| Windows Credential Manager | Windows | Good |
-| AWS Secrets Manager | Any | Best |
-| IAM Database Authentication | Aurora | Best |
+| Method | Platform | Security Level | Notes |
+|--------|----------|----------------|-------|
+| IAM Database Authentication | Aurora | **Recommended** | No passwords — uses IAM roles/tokens |
+| AWS Secrets Manager | Any | **Recommended** | Rotatable, auditable, no plaintext |
+| `~/.my.cnf` (chmod 600) | Linux | Acceptable | File-system ACL protected |
+| Windows Credential Manager | Windows | Acceptable | OS-level encrypted store |
+| `MYSQL_PWD` env var | Linux/Windows | **Use with caution** | Deprecated by MySQL. Visible in `/proc/<pid>/environ` to root. Use only for ad-hoc runs, never in automation. |
+| `-p` on command line | Any | **Never use** | Visible in `ps` output to all users |
+
+> **AWS Best Practice:** For scheduled/automated runs, use IAM database authentication with an EC2 instance role,
+> or retrieve credentials from Secrets Manager at runtime. Never store credentials in scripts or version control.
 
 ---
 
